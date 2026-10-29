@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Create a 2021 Ottawa population layer aligned to the 2020 land-use grid.
+"""Create Ottawa population layers aligned to the 2020 land-use grid.
 
-The first version uses uniform population density within each 2021
-Dissemination Area. It writes:
+The script uses uniform population density within each census year's
+Dissemination Areas. It writes:
 
 * Idrisi/TerrSet .rst/.rdc versions of the same rasters;
 * a GeoPackage containing the joined DA population attributes;
@@ -21,6 +21,7 @@ import argparse
 import csv
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import geopandas as gpd
@@ -36,6 +37,60 @@ IDRISI_REFERENCE_SYSTEM = "utm-18n"
 NODATA = -9999.0
 
 
+@dataclass(frozen=True)
+class CensusYearSpec:
+    year: int
+    raw_census_path: Path
+    boundary_path: Path
+    encoding: str
+    dauid_column: str
+    characteristic_column: str
+    characteristic_value: str
+    population_column: str
+
+
+CENSUS_SPECS = {
+    2011: CensusYearSpec(
+        year=2011,
+        raw_census_path=Path(
+            "data/census/2011/census/98-316-XWE2011001-1501-ONT.csv"
+        ),
+        boundary_path=Path("data/census/2011/da_boundaries/gda_000a11a_e.shp"),
+        encoding="cp1252",
+        dauid_column="Geo_Code",
+        characteristic_column="Characteristic",
+        characteristic_value="Population in 2011",
+        population_column="Total",
+    ),
+    2016: CensusYearSpec(
+        year=2016,
+        raw_census_path=Path(
+            "data/census/2016/census/98-401-X2016044_ONTARIO_English_CSV_data.csv"
+        ),
+        boundary_path=Path("data/census/2016/da_boundaries/lda_000a16a_e.shp"),
+        encoding="utf-8-sig",
+        dauid_column="GEO_CODE (POR)",
+        characteristic_column=(
+            "DIM: Profile of Dissemination Areas (2247)"
+        ),
+        characteristic_value="Population, 2016",
+        population_column="Dim: Sex (3): Member ID: [1]: Total - Sex",
+    ),
+    2021: CensusYearSpec(
+        year=2021,
+        raw_census_path=Path(
+            "data/census/2021/census/98-401-X2021006_English_CSV_data_Ontario.csv"
+        ),
+        boundary_path=Path("data/census/2021/da_boundaries/lda_000a21a_e.shp"),
+        encoding="cp1252",
+        dauid_column="ALT_GEO_CODE",
+        characteristic_column="CHARACTERISTIC_NAME",
+        characteristic_value="Population, 2021",
+        population_column="C1_COUNT_TOTAL",
+    ),
+}
+
+
 def parse_args() -> argparse.Namespace:
     default_project = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -44,6 +99,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=default_project,
         help="Project root containing data/ and outputs/.",
+    )
+    parser.add_argument(
+        "--years",
+        type=int,
+        nargs="+",
+        default=list(CENSUS_SPECS),
+        metavar="YEAR",
+        help="Census years to generate (available: 2011, 2016, 2021).",
     )
     parser.add_argument(
         "--overwrite",
@@ -63,8 +126,12 @@ def read_idrisi_metadata(path: Path) -> dict[str, str]:
     return metadata
 
 
-def create_population_profile(raw_census_path: Path, profile_path: Path) -> None:
-    """Extract Ottawa DA populations from the raw Statistics Canada table."""
+def create_population_profile(
+    spec: CensusYearSpec,
+    raw_census_path: Path,
+    profile_path: Path,
+) -> None:
+    """Extract Ottawa DA populations from a raw Statistics Canada table."""
 
     print(f"Creating population profile: {profile_path}")
     profile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,16 +140,15 @@ def create_population_profile(raw_census_path: Path, profile_path: Path) -> None
 
     try:
         with raw_census_path.open(
-            "r", encoding="cp1252", newline=""
+            "r", encoding=spec.encoding, newline=""
         ) as source, temporary_path.open(
             "w", encoding="utf-8", newline=""
         ) as destination:
             reader = csv.DictReader(source)
             required_columns = {
-                "ALT_GEO_CODE",
-                "GEO_LEVEL",
-                "CHARACTERISTIC_NAME",
-                "C1_COUNT_TOTAL",
+                spec.dauid_column,
+                spec.characteristic_column,
+                spec.population_column,
             }
             missing_columns = required_columns.difference(reader.fieldnames or [])
             if missing_columns:
@@ -91,18 +157,19 @@ def create_population_profile(raw_census_path: Path, profile_path: Path) -> None
                 )
 
             writer = csv.writer(destination)
-            writer.writerow(["DAUID", "population_2021"])
+            writer.writerow(["DAUID", f"population_{spec.year}"])
             for row in reader:
-                dauid = row["ALT_GEO_CODE"].strip()
+                dauid = row[spec.dauid_column].strip()
                 if not (
-                    row["GEO_LEVEL"].strip() == "Dissemination area"
+                    len(dauid) == 8
                     and dauid.startswith(OTTAWA_DA_PREFIX)
-                    and row["CHARACTERISTIC_NAME"].strip() == "Population, 2021"
+                    and row[spec.characteristic_column].strip()
+                    == spec.characteristic_value
                 ):
                     continue
 
-                population = row["C1_COUNT_TOTAL"].strip().replace(",", "")
-                if not population:
+                population = row[spec.population_column].strip().replace(",", "")
+                if not population or population == "...":
                     raise ValueError(f"Missing population for DAUID {dauid}.")
                 writer.writerow([dauid, population])
                 extracted_rows += 1
@@ -180,7 +247,7 @@ def write_idrisi_real(
             "flag def'n  : missing data",
             "legend cats : 0",
             "lineage     :",
-            "comment     : Created from Statistics Canada 2021 DA population data.",
+            "comment     : Created from Statistics Canada DA population data.",
             "",
         ]
     )
@@ -264,28 +331,22 @@ def write_optional_geotiff(
     return True
 
 
-def main() -> None:
-    args = parse_args()
-    project_dir = args.project_dir.resolve()
-    data_dir = project_dir / "data"
-    output_dir = project_dir / "outputs" / "ottawa_population"
-    output_dir.mkdir(parents=True, exist_ok=True)
+def generate_population_layer(
+    spec: CensusYearSpec,
+    project_dir: Path,
+    land_use_metadata_path: Path,
+    overwrite: bool,
+) -> None:
+    """Create the population layer for one census year."""
 
     profile_path = (
         project_dir
         / "outputs"
         / "ottawa_da_analysis"
-        / "ottawa_da_census_2021_profile.csv"
+        / f"ottawa_da_census_{spec.year}_profile.csv"
     )
-    raw_census_path = (
-        data_dir
-        / "census"
-        / "2021"
-        / "census"
-        / "98-401-X2021006_English_CSV_data_Ontario.csv"
-    )
-    da_path = data_dir / "census" / "2021" / "da_boundaries" / "lda_000a21a_e.shp"
-    land_use_metadata_path = data_dir / "LU Ottawa rst" / "LU2020 Ottawa_b1.rdc"
+    raw_census_path = project_dir / spec.raw_census_path
+    da_path = project_dir / spec.boundary_path
 
     for path in (da_path, land_use_metadata_path):
         if not path.exists():
@@ -294,17 +355,18 @@ def main() -> None:
     if not profile_path.exists():
         if not raw_census_path.exists():
             raise FileNotFoundError(raw_census_path)
-        create_population_profile(raw_census_path, profile_path)
+        create_population_profile(spec, raw_census_path, profile_path)
 
-    density_rst = output_dir / "ottawa_population_density_2021.rst"
-    density_rdc = output_dir / "ottawa_population_density_2021.rdc"
-    count_rst = output_dir / "ottawa_population_count_2021.rst"
-    count_rdc = output_dir / "ottawa_population_count_2021.rdc"
-    da_gpkg = output_dir / "ottawa_population_2021_da.gpkg"
-    summary_path = output_dir / "ottawa_population_2021_summary.json"
-
-    density_tif = output_dir / "ottawa_population_density_2021.tif"
-    count_tif = output_dir / "ottawa_population_count_2021.tif"
+    output_dir = project_dir / "outputs" / "ottawa_population" / str(spec.year)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    density_rst = output_dir / f"ottawa_population_density_{spec.year}.rst"
+    density_rdc = output_dir / f"ottawa_population_density_{spec.year}.rdc"
+    count_rst = output_dir / f"ottawa_population_count_{spec.year}.rst"
+    count_rdc = output_dir / f"ottawa_population_count_{spec.year}.rdc"
+    da_gpkg = output_dir / f"ottawa_population_{spec.year}_da.gpkg"
+    summary_path = output_dir / f"ottawa_population_{spec.year}_summary.json"
+    density_tif = output_dir / f"ottawa_population_density_{spec.year}.tif"
+    count_tif = output_dir / f"ottawa_population_count_{spec.year}.tif"
 
     output_paths = (
         density_rst,
@@ -315,35 +377,36 @@ def main() -> None:
         summary_path,
     )
     for path in output_paths:
-        remove_if_allowed(path, args.overwrite)
+        remove_if_allowed(path, overwrite)
 
+    population_column = f"population_{spec.year}"
     profile = pd.read_csv(profile_path, dtype={"DAUID": str})
     profile["DAUID"] = profile["DAUID"].str.strip()
-    profile["population_2021"] = pd.to_numeric(
-        profile["population_2021"], errors="coerce"
+    profile[population_column] = pd.to_numeric(
+        profile[population_column], errors="coerce"
     )
     profile = profile[profile["DAUID"].str.startswith(OTTAWA_DA_PREFIX)].copy()
 
     if profile["DAUID"].duplicated().any():
         raise ValueError("The population table contains duplicate DAUID values.")
-    if profile["population_2021"].isna().any():
+    if profile[population_column].isna().any():
         raise ValueError("Some Ottawa DAs have missing population values.")
 
     da_all = gpd.read_file(da_path)
     da_all["DAUID"] = da_all["DAUID"].astype(str).str.strip()
     da = da_all[da_all["DAUID"].str.startswith(OTTAWA_DA_PREFIX)].copy()
     da = da.merge(
-        profile[["DAUID", "population_2021"]],
+        profile[["DAUID", population_column]],
         on="DAUID",
         how="left",
         validate="one_to_one",
     )
-    if da["population_2021"].isna().any():
+    if da[population_column].isna().any():
         raise ValueError("Some DA boundary polygons did not receive population.")
 
     da = da.to_crs(TARGET_CRS)
     da["area_km2"] = da.geometry.area / 1_000_000
-    da["population_density_km2"] = da["population_2021"] / da["area_km2"].replace(
+    da["population_density_km2"] = da[population_column] / da["area_km2"].replace(
         0, np.nan
     )
 
@@ -376,13 +439,13 @@ def main() -> None:
     ).astype("float32")
 
     valid_count = count_array[count_array != NODATA]
-    census_total = float(da["population_2021"].sum())
+    census_total = float(da[population_column].sum())
     raster_total = float(valid_count.sum())
     difference_pct = 100 * (raster_total - census_total) / census_total
     if abs(difference_pct) >= 2:
         raise ValueError(
-            f"Raster population differs from Census total by {difference_pct:.3f}%. "
-            "Check CRS, grid extent, and boundary coverage."
+            f"Raster population differs from {spec.year} Census total by "
+            f"{difference_pct:.3f}%. Check CRS, grid extent, and boundary coverage."
         )
 
     geotiff_written = (
@@ -419,7 +482,7 @@ def main() -> None:
         max_x=max_x,
         min_y=min_y,
         max_y=max_y,
-        title="2021 Ottawa population density",
+        title=f"{spec.year} Ottawa population density",
         display_min=float(density_valid.min()),
         display_max=float(density_valid.max()),
     )
@@ -434,15 +497,19 @@ def main() -> None:
         max_x=max_x,
         min_y=min_y,
         max_y=max_y,
-        title="2021 Ottawa population per 30 m cell",
+        title=f"{spec.year} Ottawa population per 30 m cell",
         display_min=float(count_valid.min()),
         display_max=float(count_valid.max()),
     )
 
-    da.to_file(da_gpkg, layer="ottawa_population_2021_da", driver="GPKG")
+    da.to_file(
+        da_gpkg,
+        layer=f"ottawa_population_{spec.year}_da",
+        driver="GPKG",
+    )
 
     summary = {
-        "census_year": 2021,
+        "census_year": spec.year,
         "source_population_table": str(profile_path),
         "source_boundary_file": str(da_path),
         "land_use_grid_metadata": str(land_use_metadata_path),
@@ -466,13 +533,37 @@ def main() -> None:
         summary["population_count_geotiff"] = str(count_tif)
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    print(f"Ottawa DAs: {len(da):,}")
-    print(f"Census population: {census_total:,.0f}")
+    print(f"Ottawa DAs ({spec.year}): {len(da):,}")
+    print(f"Census population ({spec.year}): {census_total:,.0f}")
     print(f"Raster population estimate: {raster_total:,.1f}")
     print(f"Difference: {difference_pct:.3f}%")
-    print("\nCreated files:")
+    print("Created files:")
     for path in output_paths:
         print(f" - {path}")
+
+
+def main() -> None:
+    args = parse_args()
+    requested_years = list(dict.fromkeys(args.years))
+    unsupported_years = [year for year in requested_years if year not in CENSUS_SPECS]
+    if unsupported_years:
+        raise SystemExit(
+            "Unsupported census year(s): "
+            f"{', '.join(map(str, unsupported_years))}. "
+            "The current 2001 and 2006 inputs are IVT files; export them to "
+            "CSV before adding those years."
+        )
+
+    project_dir = args.project_dir.resolve()
+    land_use_metadata_path = project_dir / "data" / "LU Ottawa rst" / "LU2020 Ottawa_b1.rdc"
+    for year in requested_years:
+        print(f"\nGenerating {year} population layer...")
+        generate_population_layer(
+            CENSUS_SPECS[year],
+            project_dir,
+            land_use_metadata_path,
+            args.overwrite,
+        )
 
 
 if __name__ == "__main__":
