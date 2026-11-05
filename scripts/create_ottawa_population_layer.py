@@ -42,20 +42,44 @@ class CensusYearSpec:
     year: int
     raw_census_path: Path
     boundary_path: Path
-    encoding: str
-    dauid_column: str
-    characteristic_column: str
-    characteristic_value: str
-    population_column: str
+    source_format: str
+    boundary_layer: str | None = None
+    boundary_bbox: tuple[float, float, float, float] | None = None
+    missing_population_default: float | None = None
+    encoding: str | None = None
+    dauid_column: str | None = None
+    characteristic_column: str | None = None
+    characteristic_value: str | None = None
+    population_column: str | None = None
 
 
 CENSUS_SPECS = {
+    2001: CensusYearSpec(
+        year=2001,
+        raw_census_path=Path(
+            "data/census/2001/census/95F0495XCB2001002.IVT"
+        ),
+        boundary_path=Path("data/census/2001/da_boundaries/gda_000b02a_e.e00"),
+        source_format="ivt",
+        boundary_layer="PAL",
+        boundary_bbox=(-76.6, 44.8, -75.0, 45.8),
+    ),
+    2006: CensusYearSpec(
+        year=2006,
+        raw_census_path=Path(
+            "data/census/2006/census/94-581-XCB2006002.IVT"
+        ),
+        boundary_path=Path("data/census/2006/da_boundaries/gda_000a06a_e.shp"),
+        source_format="ivt",
+        missing_population_default=0.0,
+    ),
     2011: CensusYearSpec(
         year=2011,
         raw_census_path=Path(
             "data/census/2011/census/98-316-XWE2011001-1501-ONT.csv"
         ),
         boundary_path=Path("data/census/2011/da_boundaries/gda_000a11a_e.shp"),
+        source_format="csv",
         encoding="cp1252",
         dauid_column="Geo_Code",
         characteristic_column="Characteristic",
@@ -68,6 +92,7 @@ CENSUS_SPECS = {
             "data/census/2016/census/98-401-X2016044_ONTARIO_English_CSV_data.csv"
         ),
         boundary_path=Path("data/census/2016/da_boundaries/lda_000a16a_e.shp"),
+        source_format="csv",
         encoding="utf-8-sig",
         dauid_column="GEO_CODE (POR)",
         characteristic_column=(
@@ -82,6 +107,7 @@ CENSUS_SPECS = {
             "data/census/2021/census/98-401-X2021006_English_CSV_data_Ontario.csv"
         ),
         boundary_path=Path("data/census/2021/da_boundaries/lda_000a21a_e.shp"),
+        source_format="csv",
         encoding="cp1252",
         dauid_column="ALT_GEO_CODE",
         characteristic_column="CHARACTERISTIC_NAME",
@@ -106,7 +132,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=list(CENSUS_SPECS),
         metavar="YEAR",
-        help="Census years to generate (available: 2011, 2016, 2021).",
+        help="Census years to generate (available: 2001, 2006, 2011, 2016, 2021).",
     )
     parser.add_argument(
         "--overwrite",
@@ -132,6 +158,23 @@ def create_population_profile(
     profile_path: Path,
 ) -> None:
     """Extract Ottawa DA populations from a raw Statistics Canada table."""
+
+    if spec.source_format == "ivt":
+        create_population_profile_from_ivt(spec, raw_census_path, profile_path)
+        return
+    if spec.source_format != "csv":
+        raise ValueError(f"Unsupported census source format: {spec.source_format}")
+    if not all(
+        value is not None
+        for value in (
+            spec.encoding,
+            spec.dauid_column,
+            spec.characteristic_column,
+            spec.characteristic_value,
+            spec.population_column,
+        )
+    ):
+        raise ValueError(f"Incomplete CSV configuration for census year {spec.year}.")
 
     print(f"Creating population profile: {profile_path}")
     profile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -185,6 +228,88 @@ def create_population_profile(
             temporary_path.unlink()
 
     print(f"Created population profile with {extracted_rows:,} Ottawa DAs.")
+
+
+def create_population_profile_from_ivt(
+    spec: CensusYearSpec,
+    raw_census_path: Path,
+    profile_path: Path,
+) -> None:
+    """Extract Ottawa DA populations from a Statistics Canada IVT file."""
+
+    try:
+        import pyivt
+    except ImportError as exc:
+        raise RuntimeError(
+            "IVT processing requires pyivt and pyarrow. Install them with "
+            "'.venv/bin/python -m pip install pyivt pyarrow'."
+        ) from exc
+
+    print(f"Creating population profile from IVT: {profile_path}")
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ivt = pyivt.open(raw_census_path)
+    member_tables = ivt.to_member_tables()
+    profile_dimension = next(
+        key
+        for key, table in member_tables.items()
+        if "label_en" in table.column_names
+        and table.to_pandas()["label_en"]
+        .astype(str)
+        .str.match(fr"^Population,\s*{spec.year}\b")
+        .any()
+    )
+    geography_dimension = "geography"
+
+    profile_members = member_tables[profile_dimension].to_pandas()
+    population_member = profile_members[
+        profile_members["label_en"].astype(str).str.match(
+            fr"^Population,\s*{spec.year}\b"
+        )
+    ]
+    if len(population_member) != 1:
+        raise ValueError(
+            f"Expected one population member for {spec.year}, found "
+            f"{len(population_member)}."
+        )
+    population_code = int(population_member.iloc[0]["code"])
+
+    geography_members = member_tables[geography_dimension].to_pandas()
+    geography_members["DAUID"] = geography_members["label_en"].astype(str).str.extract(
+        rf"({OTTAWA_DA_PREFIX}\d{{4}})", expand=False
+    )
+    ottawa_das = geography_members[geography_members["DAUID"].notna()].copy()
+    if ottawa_das.empty:
+        raise ValueError(f"No Ottawa DAs found in IVT file: {raw_census_path}")
+
+    selection = {
+        profile_dimension: [population_code],
+        geography_dimension: ottawa_das["code"].astype(int).tolist(),
+    }
+    values = ivt.to_arrow(selection=selection).to_pydict()
+    value_by_code = dict(
+        zip(values[geography_dimension], values["value"], strict=True)
+    )
+    ottawa_das["population"] = ottawa_das["code"].map(value_by_code)
+    if ottawa_das["population"].isna().any():
+        missing = ottawa_das.loc[ottawa_das["population"].isna(), "DAUID"].tolist()
+        raise ValueError(
+            f"Missing {spec.year} population values for Ottawa DAs: {missing[:5]}"
+        )
+
+    temporary_path = profile_path.with_name(f".{profile_path.name}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8", newline="") as destination:
+            writer = csv.writer(destination)
+            writer.writerow(["DAUID", f"population_{spec.year}"])
+            for row in ottawa_das[["DAUID", "population"]].itertuples(index=False):
+                writer.writerow([row.DAUID, row.population])
+        os.replace(temporary_path, profile_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+    print(f"Created population profile with {len(ottawa_das):,} Ottawa DAs.")
 
 
 def remove_if_allowed(path: Path, overwrite: bool) -> None:
@@ -392,7 +517,12 @@ def generate_population_layer(
     if profile[population_column].isna().any():
         raise ValueError("Some Ottawa DAs have missing population values.")
 
-    da_all = gpd.read_file(da_path)
+    read_kwargs = {}
+    if spec.boundary_layer is not None:
+        read_kwargs["layer"] = spec.boundary_layer
+    if spec.boundary_bbox is not None:
+        read_kwargs["bbox"] = spec.boundary_bbox
+    da_all = gpd.read_file(da_path, **read_kwargs)
     da_all["DAUID"] = da_all["DAUID"].astype(str).str.strip()
     da = da_all[da_all["DAUID"].str.startswith(OTTAWA_DA_PREFIX)].copy()
     da = da.merge(
@@ -401,8 +531,22 @@ def generate_population_layer(
         how="left",
         validate="one_to_one",
     )
-    if da[population_column].isna().any():
-        raise ValueError("Some DA boundary polygons did not receive population.")
+    missing_population = da[population_column].isna()
+    if missing_population.any():
+        missing_dauids = da.loc[missing_population, "DAUID"].tolist()
+        if spec.missing_population_default is None:
+            raise ValueError(
+                "Some DA boundary polygons did not receive population: "
+                f"{missing_dauids[:10]}"
+            )
+        print(
+            f"Warning: assigning {spec.missing_population_default} population to "
+            f"{len(missing_dauids)} boundary DAs absent from the {spec.year} "
+            f"profile: {missing_dauids}"
+        )
+        da.loc[missing_population, population_column] = (
+            spec.missing_population_default
+        )
 
     da = da.to_crs(TARGET_CRS)
     da["area_km2"] = da.geometry.area / 1_000_000
@@ -549,9 +693,8 @@ def main() -> None:
     if unsupported_years:
         raise SystemExit(
             "Unsupported census year(s): "
-            f"{', '.join(map(str, unsupported_years))}. "
-            "The current 2001 and 2006 inputs are IVT files; export them to "
-            "CSV before adding those years."
+            f"{', '.join(map(str, unsupported_years))}. Available years: "
+            f"{', '.join(map(str, CENSUS_SPECS))}."
         )
 
     project_dir = args.project_dir.resolve()
